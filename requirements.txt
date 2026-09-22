@@ -1,0 +1,12 @@
+# Dependencies for zenduone_billing_to_zoho.py
+#
+# Everything else the script uses (os, json, datetime) is in the standard
+# library, so this is the complete list.
+#
+# Bounds rather than exact pins: the lower bound is what the code actually
+# needs, the upper bound stops a future major release from silently breaking
+# the scheduled 10 AM run. Tighten to exact pins (==) if you want fully
+# reproducible CI builds.
+
+requests>=2.31,<3      # HTTP calls to the ZenduOne billing API and Zoho Analytics
+pandas>=2.0,<4         # row normalisation + CSV generation for the Zoho import
