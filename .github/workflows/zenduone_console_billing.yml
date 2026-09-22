@@ -1,0 +1,102 @@
+name: ZenduOne Billing -> Zoho Analytics
+
+# ---------------------------------------------------------------------------
+# Runs the billing report sync every day at 10:00 AM Eastern.
+#
+# GitHub Actions cron is ALWAYS evaluated in UTC and has no timezone support,
+# so a single cron line cannot hold 10:00 Eastern across daylight saving:
+#   10:00 EST (winter, UTC-5) = 15:00 UTC
+#   10:00 EDT (summer, UTC-4) = 14:00 UTC
+# So we fire at BOTH hours and let the "Gate on Eastern local time" step below
+# drop whichever one isn't actually 10:00 in America/New_York that day.
+#
+# If you'd rather pin to literal EST year-round (i.e. accept 11:00 local in
+# summer), delete the '0 14 * * *' line and the gate step.
+# ---------------------------------------------------------------------------
+on:
+  schedule:
+    - cron: '0 14 * * *'   # 10:00 America/New_York while EDT is in effect
+    - cron: '0 15 * * *'   # 10:00 America/New_York while EST is in effect
+  workflow_dispatch:        # lets you trigger a run by hand from the Actions tab
+
+# Never let a slow run overlap with the next scheduled one.
+concurrency:
+  group: zenduone-billing-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  SCRIPT_PATH: scripts/Zenduma.py
+  REQUIREMENTS_FILE: requirements.txt
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # On a scheduled trigger, proceed only when it is really 10:00 in
+      # America/New_York. Manual (workflow_dispatch) runs always proceed.
+      # Skipped runs finish green rather than red, so the Actions tab stays clean.
+      - name: Gate on Eastern local time
+        id: gate
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "Manual run - proceeding."
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            hour="$(TZ=America/New_York date +%H)"
+            if [ "$hour" = "10" ]; then
+              echo "Eastern local time is ${hour}:00 - proceeding."
+              echo "run=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Eastern local time is ${hour}:00, not 10:00 - skipping (DST duplicate)."
+              echo "run=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Check out repository
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f "$REQUIREMENTS_FILE" ]; then
+            pip install -r "$REQUIREMENTS_FILE"
+          else
+            echo "No $REQUIREMENTS_FILE found - installing dependencies directly."
+            pip install requests pandas
+          fi
+
+      - name: Run billing sync
+        if: steps.gate.outputs.run == 'true'
+        env:
+          # Source: ZenduOne admin console session token.
+          # HEADS UP - this is a browser session cookie, not a long-lived API
+          # key. It expires, and when it does this job fails with a 401 until
+          # the ZENDUONE_API_TOKEN secret is refreshed by hand.
+          ZENDUONE_API_TOKEN: ${{ secrets.ZENDUONE_API_TOKEN }}
+
+          # Destination: Zoho Analytics OAuth self-client.
+          # Secret names are uppercase (GitHub convention); the script reads
+          # the lowercase env var names below.
+          zoho_analytics_client_id: ${{ secrets.ZOHO_ANALYTICS_CLIENT_ID }}
+          zoho_analytics_client_secret: ${{ secrets.ZOHO_ANALYTICS_CLIENT_SECRET }}
+          zoho_analytics_refresh_token: ${{ secrets.ZOHO_ANALYTICS_REFRESH_TOKEN }}
+
+          # Optional overrides - the script already defaults to these values,
+          # so leave the secrets/vars unset unless you need to change targets.
+          ZOHO_ORG_ID: ${{ vars.ZOHO_ORG_ID || '67409019' }}
+          ZOHO_WORKSPACE_ID: ${{ vars.ZOHO_WORKSPACE_ID || '953790000013364003' }}
+          ZOHO_TABLE_NAME: ${{ vars.ZOHO_TABLE_NAME || 'Zenduone_console_report' }}
+        run: python main.py
