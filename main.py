@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ZenduOne Billing Report -> Zoho Analytics sync  (v2 - pagination fix)
+ZenduOne Billing Report -> Zoho Analytics sync  (v3 - pagination fix + self sign-in)
 =====================================================================
 
 Pulls every row from the ZenduOne Admin Console "Billing Report"
@@ -32,12 +32,18 @@ Base:  https://one-service.zenduit.com
 Count: POST /billing/installations/count  body {}              -> {"count": N}
 List:  POST /billing/installations/list   body {offset, limit} -> [ {...}, ... ]
 
-Auth: the `auth_one_console` cookie value from a logged-in admin console
-session, sent verbatim as the `Authorization` header. Pass it in via
-ZENDUONE_API_TOKEN each run.
+Auth (v3): the script now SIGNS IN BY ITSELF every run, exactly like the
+console's sign-in page does:
+    POST https://one-service.zenduit.com/auth  {"username": ..., "password": ...}
+      -> {"token": "..."}
+and sends that token verbatim as the `Authorization` header. No more pasting
+browser cookies into GitHub secrets, no more 401s when a cookie expires.
 
 Required environment variables:
-    ZENDUONE_API_TOKEN            - fresh auth_one_console token
+    ZENDUONE_USERNAME             - console login (ideally a dedicated service user)
+    ZENDUONE_PASSWORD             - its password
+      (legacy fallback: ZENDUONE_API_TOKEN - a pasted auth_one_console cookie.
+       Only used if username/password are not set. It expires.)
     zoho_analytics_client_id      - falls back to ZOHO_CLIENT_ID_UNI / ZOHO_CLIENT_ID
     zoho_analytics_client_secret  - falls back to ZOHO_CLIENT_SECRET_UNI / ZOHO_CLIENT_SECRET
     zoho_analytics_refresh_token  - falls back to ZOHO_REFRESH_TOKEN_UNI / ZOHO_REFRESH_TOKEN
@@ -65,7 +71,10 @@ import pandas as pd
 # ZENDUONE BILLING API CONFIG
 # ==========================================================
 ONE_CONSOLE_BASE = "https://one-service.zenduit.com"
-ZENDUONE_API_TOKEN = os.environ.get("ZENDUONE_API_TOKEN")
+ZENDUONE_USERNAME = os.environ.get("ZENDUONE_USERNAME")
+ZENDUONE_PASSWORD = os.environ.get("ZENDUONE_PASSWORD")
+ZENDUONE_API_TOKEN = os.environ.get("ZENDUONE_API_TOKEN")  # legacy fallback
+_one_console_token = None
 PAGE_SIZE = int(os.environ.get("ONE_CONSOLE_PAGE_SIZE", "1000"))
 MAX_PASSES = int(os.environ.get("ONE_CONSOLE_MAX_PASSES", "5"))
 ALLOW_PARTIAL = os.environ.get("ALLOW_PARTIAL") == "1"
@@ -120,26 +129,70 @@ TABLE_COLUMNS = [
 # ==========================================================
 # EXTRACT: ZenduOne Billing Report
 # ==========================================================
-def _one_console_post(path, payload, timeout=120):
-    if not ZENDUONE_API_TOKEN:
+def _one_console_login():
+    """Sign in the same way the admin console does and return a fresh token."""
+    res = requests.post(
+        f"{ONE_CONSOLE_BASE}/auth",
+        json={"username": ZENDUONE_USERNAME, "password": ZENDUONE_PASSWORD},
+        headers={"Content-Type": "application/json",
+                 "Accept": "application/json, text/plain, */*"},
+        timeout=60,
+    )
+    if res.status_code in (400, 401, 403):
         raise SystemExit(
-            "ZENDUONE_API_TOKEN is not set. It must be a fresh 'auth_one_console' "
-            "cookie value from a logged-in https://zenduone-admin.firebaseapp.com session."
+            f"ZenduOne sign-in failed ({res.status_code}). Check the ZENDUONE_USERNAME / "
+            "ZENDUONE_PASSWORD secrets - try the same login at "
+            "https://zenduone-admin.firebaseapp.com/sign-in."
         )
+    res.raise_for_status()
+    token = (res.json() or {}).get("token")
+    if not token:
+        raise SystemExit("ZenduOne sign-in returned no token - aborting.")
+    print("🔐 Signed in to ZenduOne console API")
+    return token
+
+
+def _get_one_console_token(force_refresh=False):
+    global _one_console_token
+    if _one_console_token and not force_refresh:
+        return _one_console_token
+    if ZENDUONE_USERNAME and ZENDUONE_PASSWORD:
+        _one_console_token = _one_console_login()
+    elif ZENDUONE_API_TOKEN and not force_refresh:
+        print("⚠️  Using legacy ZENDUONE_API_TOKEN (browser cookie) - it will expire. "
+              "Set ZENDUONE_USERNAME / ZENDUONE_PASSWORD instead.")
+        _one_console_token = ZENDUONE_API_TOKEN
+    else:
+        raise SystemExit(
+            "No usable ZenduOne credentials. Set the ZENDUONE_USERNAME and "
+            "ZENDUONE_PASSWORD secrets (recommended), or a fresh ZENDUONE_API_TOKEN."
+        )
+    return _one_console_token
+
+
+def _one_console_post(path, payload, timeout=120, _retried=False):
     res = requests.post(
         f"{ONE_CONSOLE_BASE}{path}",
         json=payload,
         headers={
-            "Authorization": ZENDUONE_API_TOKEN,
+            "Authorization": _get_one_console_token(),
             "Content-Type": "application/json",
             "Accept": "application/json, text/plain, */*",
         },
         timeout=timeout,
     )
     if res.status_code in (401, 403):
+        # Token expired mid-run (or legacy cookie is stale): sign in again once.
+        if not _retried and ZENDUONE_USERNAME and ZENDUONE_PASSWORD:
+            print(f"   {res.status_code} from {path} - signing in again and retrying…")
+            _get_one_console_token(force_refresh=True)
+            return _one_console_post(path, payload, timeout, _retried=True)
         raise SystemExit(
-            f"ZenduOne API returned {res.status_code} - the auth_one_console token "
-            "is expired or invalid. Grab a fresh one from the console and re-run."
+            f"ZenduOne API returned {res.status_code} on {path}. "
+            + ("The login works but this user may lack access to the Billing Report."
+               if ZENDUONE_USERNAME else
+               "The pasted ZENDUONE_API_TOKEN cookie has expired. Set ZENDUONE_USERNAME / "
+               "ZENDUONE_PASSWORD secrets so the script signs in by itself.")
         )
     res.raise_for_status()
     return res.json()
@@ -217,7 +270,7 @@ def fetch_billing_rows():
     print(f"   Unique rows after single request: {len(store):,}/{total:,}")
 
     # 2) Fallback: repeated paging passes, de-duplicated, until we reach `total`
-    #    or two passes in a row add nothing new.
+    #    or a pass adds nothing new.
     pass_no = 0
     empty_passes = 0
     while len(store) < total and pass_no < MAX_PASSES:
