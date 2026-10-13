@@ -28,7 +28,6 @@ permissions:
   contents: read
 
 env:
-  SCRIPT_PATH: scripts/Zenduma.py
   REQUIREMENTS_FILE: requirements.txt
 
 jobs:
@@ -81,10 +80,12 @@ jobs:
       - name: Run billing sync
         if: steps.gate.outputs.run == 'true'
         env:
-          # Source: ZenduOne admin console session token.
-          # HEADS UP - this is a browser session cookie, not a long-lived API
-          # key. It expires, and when it does this job fails with a 401 until
-          # the ZENDUONE_API_TOKEN secret is refreshed by hand.
+          # Source: ZenduOne admin console login. The script signs in by itself
+          # (POST one-service.zenduit.com/auth) every run, so nothing expires.
+          ZENDUONE_USERNAME: ${{ secrets.ZENDUONE_USERNAME }}
+          ZENDUONE_PASSWORD: ${{ secrets.ZENDUONE_PASSWORD }}
+          # Legacy fallback (browser cookie, expires) - only used if the two
+          # secrets above are missing. Safe to delete once they're set.
           ZENDUONE_API_TOKEN: ${{ secrets.ZENDUONE_API_TOKEN }}
 
           # Destination: Zoho Analytics OAuth self-client.
